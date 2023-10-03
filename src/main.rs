@@ -57,7 +57,6 @@ impl Transaction {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Get command-line arguments
     let args: Vec<String> = env::args().collect();
 
     if args.len() != 2 {
@@ -65,10 +64,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
-    // Get the input file name from the command-line arguments
     let file_in = &args[1];
 
-    let client_accounts = process_transaction(file_in).await?;
+    let client_accounts = process_transactions(file_in).await?;
 
     print!("client, available, held, total, locked\n");
     print_client_accounts(client_accounts).await;
@@ -76,7 +74,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn process_transaction(
+// Asynchronously reads a stream from a CSV file and spawns workers which are sent transactions to be processed.
+// Returns end state for each Client Account
+async fn process_transactions(
     file_in: &str,
 ) -> Result<Arc<RwLock<HashMap<u16, Arc<Mutex<ClientAccount>>>>>, Box<dyn Error>>
 {
@@ -102,26 +102,11 @@ async fn process_transaction(
                 let sender = senders
                     .entry(client_id)
                     .or_insert_with(|| {
-                        let (sender, mut receiver) =
-                            mpsc::channel::<Transaction>(32);
-                        let txs_clone = txs.clone();
-                        let client_accounts_clone = client_accounts.clone();
-                        let task = tokio::spawn(async move {
-                            while let Some(transaction) = receiver.recv().await
-                            {
-                                if transaction.transaction_type == "end" {
-                                    break;
-                                }
-                                let _ = handle_transaction(
-                                    &transaction,
-                                    &client_accounts_clone,
-                                    &txs_clone,
-                                )
-                                .await;
-                            }
-                        });
-                        tasks.push(task);
-                        Arc::new(Mutex::new(sender.clone()))
+                        spawn_worker(
+                            txs.clone(),
+                            client_accounts.clone(),
+                            &mut tasks,
+                        )
                     })
                     .clone();
 
@@ -171,6 +156,39 @@ async fn process_transaction(
     Ok(client_accounts)
 }
 
+//creates a worker which gets gradually sent transactions to be processed
+//the order of transactions gets preserved because users can only affect their own state and workers are spawned per user
+//when it receives a transaction type called "end" it will know the workload is finished and exit
+//Returns sender to be stored for future use
+fn spawn_worker(
+    txs_clone: Arc<RwLock<HashMap<u32, Transaction>>>,
+    client_accounts_clone: Arc<RwLock<HashMap<u16, Arc<Mutex<ClientAccount>>>>>,
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> Arc<Mutex<mpsc::Sender<Transaction>>> {
+    let (sender, mut receiver) = mpsc::channel::<Transaction>(32);
+    let sender_clone = sender.clone();
+    let txs_clone = txs_clone.clone();
+    let client_accounts_clone = client_accounts_clone.clone();
+
+    let task = tokio::spawn(async move {
+        while let Some(transaction) = receiver.recv().await {
+            if transaction.transaction_type == "end" {
+                break;
+            }
+            let _ = handle_transaction(
+                &transaction,
+                &client_accounts_clone,
+                &txs_clone,
+            )
+            .await;
+        }
+    });
+
+    tasks.push(task);
+
+    Arc::new(Mutex::new(sender_clone))
+}
+
 async fn handle_transaction(
     transaction: &Transaction,
     client_accounts: &Arc<RwLock<HashMap<u16, Arc<Mutex<ClientAccount>>>>>,
@@ -204,6 +222,7 @@ async fn handle_transaction(
     }
 }
 
+//Add to available balance and total if transaction is valid
 async fn handle_deposit(
     client_accounts: &Arc<RwLock<HashMap<u16, Arc<Mutex<ClientAccount>>>>>,
     transaction: &Transaction,
@@ -223,6 +242,7 @@ async fn handle_deposit(
     }
 }
 
+//Removes from available balance and total if transaction is valid
 async fn handle_withdrawal(
     client_accounts: &Arc<RwLock<HashMap<u16, Arc<Mutex<ClientAccount>>>>>,
     transaction: &Transaction,
@@ -244,6 +264,9 @@ async fn handle_withdrawal(
     }
 }
 
+//Moves disputed transactions amount value from users balance to held
+//Sets the transaction as disputed so that it is eligible to be resolved or charged back
+//This method assumes you cant dispute the same transaction more than once
 async fn handle_dispute(
     client_accounts: &Arc<RwLock<HashMap<u16, Arc<Mutex<ClientAccount>>>>>,
     transaction: &Transaction,
@@ -270,6 +293,8 @@ async fn handle_dispute(
     }
 }
 
+//Resolves transaction moving the corresponding amount from the users held into balance
+//Sets the transaction as not disputed
 async fn handle_resolve(
     client_accounts: &Arc<RwLock<HashMap<u16, Arc<Mutex<ClientAccount>>>>>,
     transaction: &Transaction,
@@ -293,6 +318,7 @@ async fn handle_resolve(
     }
 }
 
+//Removes corresponding transaction amount from held and total and locks account
 async fn handle_chargeback(
     client_accounts: &Arc<RwLock<HashMap<u16, Arc<Mutex<ClientAccount>>>>>,
     transaction: &Transaction,
@@ -352,7 +378,7 @@ mod tests {
     #[test]
     async fn test_deposit() {
         let client_accounts =
-            process_transaction("test_cases/test_deposit.csv")
+            process_transactions("test_cases/test_deposit.csv")
                 .await
                 .unwrap();
 
@@ -375,7 +401,7 @@ mod tests {
     #[test]
     async fn test_withdrawal() {
         let client_accounts =
-            process_transaction("test_cases/test_withdrawal.csv")
+            process_transactions("test_cases/test_withdrawal.csv")
                 .await
                 .unwrap();
 
@@ -391,7 +417,7 @@ mod tests {
     #[test]
     async fn test_dispute() {
         let client_accounts =
-            process_transaction("test_cases/test_dispute.csv")
+            process_transactions("test_cases/test_dispute.csv")
                 .await
                 .unwrap();
 
@@ -414,7 +440,7 @@ mod tests {
     #[test]
     async fn test_resolve() {
         let client_accounts =
-            process_transaction("test_cases/test_resolve.csv")
+            process_transactions("test_cases/test_resolve.csv")
                 .await
                 .unwrap();
 
@@ -437,7 +463,7 @@ mod tests {
     #[test]
     async fn test_chargeback() {
         let client_accounts =
-            process_transaction("test_cases/test_chargeback.csv")
+            process_transactions("test_cases/test_chargeback.csv")
                 .await
                 .unwrap();
 
@@ -460,7 +486,7 @@ mod tests {
     #[test]
     async fn mismatched_dispute_resolve() {
         let client_accounts =
-            process_transaction("test_cases/mismatch_dispute_resolve.csv")
+            process_transactions("test_cases/mismatch_dispute_resolve.csv")
                 .await
                 .unwrap();
 
@@ -476,7 +502,7 @@ mod tests {
     #[test]
     async fn test_deposit_after_frozen() {
         let client_accounts =
-            process_transaction("test_cases/test_deposit_after_frozen.csv")
+            process_transactions("test_cases/test_deposit_after_frozen.csv")
                 .await
                 .unwrap();
 
